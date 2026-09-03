@@ -123,19 +123,34 @@ redis_client: Optional[aioredis.Redis] = None
 local_cache: Dict[str, Any] = {}
 local_rate_limit: Dict[int, float] = {}
 
-# YT-DLP Standart Sozlamalari
+COOKIES_FILE = os.getenv("COOKIES_PATH", "cookies.txt")
+HAS_COOKIES = os.path.exists(COOKIES_FILE)
+
+# YT-DLP Standart Sozlamalari (Anti-Block va Client Spoofing qo'shildi)
 YDL_GENERAL_OPTS = {
     "quiet": True,
     "no_warnings": True,
     "nocheckcertificate": True,
-    "ignoreerrors": True,
-    "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "ignoreerrors": False,
+    "geo_bypass": True,
+    "user_agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1",
     "http_headers": {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.9",
     },
+    "extractor_args": {
+        "youtube": {
+            "player_client": ["android", "ios", "mweb", "web"],
+            "skip": ["hls", "dash"]
+        }
+    }
 }
+
+if HAS_COOKIES:
+    YDL_GENERAL_OPTS["cookiefile"] = COOKIES_FILE
+    logger.info("🍪 'cookies.txt' fayli topildi va yt-dlp tizimiga ulandi!")
+
 if ROTATING_PROXY:
     YDL_GENERAL_OPTS["proxy"] = ROTATING_PROXY
 
@@ -431,7 +446,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 caption_text = f"🎬 **{title}**\n\n📌 *Videoni qaysi format/sifatda yuklashni xohlaysiz?*"
                 await msg.edit_text(caption_text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
             except Exception as e:
-                await msg.edit_text(f"❌ YouTube havolasida xatolik: {str(e)[:100]}")
+                err_str = str(e)
+                if "Sign in to confirm" in err_str or "Bot Verification" in err_str or "429" in err_str:
+                    await msg.edit_text("❌ **YouTube IP blokirovkasi!** Server IP-si vaqtincha cheklandi. `cookies.txt` fayli zarur.")
+                else:
+                    await msg.edit_text(f"❌ YouTube havolasida xatolik: {err_str[:100]}")
             return
 
         # 2-B. Instagram / TikTok Mediasini Yuklash
@@ -500,11 +519,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         def search_music():
-            search_query = f"{text} official audio song"
             opts = dict(YDL_GENERAL_OPTS)
             opts.update({"extract_flat": True, "skip_download": True})
             with YoutubeDL(opts) as ydl:
-                res = ydl.extract_info(f"ytsearch20:{search_query}", download=False)
+                res = ydl.extract_info(f"ytsearch20:{text}", download=False)
                 raw_entries = res.get("entries", []) if res else []
 
                 filtered_entries = []
@@ -512,7 +530,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     if not entry:
                         continue
                     dur = entry.get("duration") or 0
-                    if 0 < dur < 45 or "#shorts" in entry.get("title", "").lower():
+                    if dur > 0 and dur < 30: # Qisqa videolarni (Shorts) o'tkazib yuborish
                         continue
                     filtered_entries.append({
                         "id": entry.get("id"),
@@ -940,7 +958,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             def download_mp3():
                 opts = dict(YDL_GENERAL_OPTS)
                 opts.update({
-                    "format": "bestaudio[ext=m4a]/bestaudio/best",
+                    "format": "bestaudio/best",
                     "outtmpl": f"{DOWNLOAD_DIR}/{file_unique_id}.%(ext)s",
                 })
                 if HAS_FFMPEG:
@@ -952,7 +970,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 with YoutubeDL(opts) as ydl:
                     ydl.extract_info(url, download=True)
                     for file in os.listdir(DOWNLOAD_DIR):
-                        if file.startswith(file_unique_id):
+                        if file.startswith(file_unique_id) and not file.endswith(".temp"):
                             return os.path.join(DOWNLOAD_DIR, file)
                     return None
 
@@ -1032,13 +1050,21 @@ def main():
         print("💡 Telegram'da @BotFather'dan olgan tokeningizni kiriting.\n")
         return
 
+    builder = Application.builder().token(TOKEN)
+
+    # Local Telegram Bot API Server ishlatilsa (2GB gacha fayl yuklash uchun)
+    local_bot_api_url = os.getenv("BOT_API_URL")
+    if local_bot_api_url:
+        builder.base_url(local_bot_api_url)
+        builder.local_mode(True)
+        logger.info(f"🚀 Local Bot API Server ishga tushirildi: {local_bot_api_url}")
+
     app = (
-        Application.builder()
-        .token(TOKEN)
-        .read_timeout(60)
-        .write_timeout(60)
-        .connect_timeout(30)
-        .pool_timeout(60)
+        builder
+        .read_timeout(120)
+        .write_timeout(120)
+        .connect_timeout(60)
+        .pool_timeout(120)
         .post_init(post_init)
         .build()
     )
