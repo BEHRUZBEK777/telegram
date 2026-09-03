@@ -24,52 +24,60 @@ from yt_dlp import YoutubeDL
 from shazamio import Shazam
 
 # ==========================================
-# 1. LOGGING VA SOZLAMALAR
+# 1. LOGGING VA ASOSIY SOZLAMALAR
 # ==========================================
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO
 )
-logger = logger = logging.getLogger(__name__)
+logger = logging.getLogger(__name__)
 
+# Telegram Bot Token va Redis manzilini muhit o'zgaruvchilaridan olish
 TOKEN = os.getenv("BOT_TOKEN", "8989465930:AAGfYIMR-Sk9PGz0ldDLraeO4_Xq-sCSSqg")
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 
-# ⚠️ YOPIQ KANAL ID-SI
+# ⚠️ YOPIQ KANAL ID-SI (Audio fayllarni doimiy saqlash uchun)
 CHANNEL_ID = int(os.getenv("CHANNEL_ID", "-1001788015387"))
 
-# Vaqtinchalik fayllar papkasi
+# Vaqtinchalik yuklamalar papkasi
 DOWNLOAD_DIR = "downloads"
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
-# SQLite Bazani Ishga tushirish
+# SQLite Lokal Bazasini Yaratish
 DB_PATH = "music_base.db"
 
 def init_db():
-    """Lokal SQLite bazasini yaratish"""
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS channel_music (
-            song_id TEXT PRIMARY KEY,
-            file_id TEXT NOT NULL,
-            title TEXT,
-            performer TEXT,
-            duration INTEGER,
-            channel_msg_id INTEGER
-        )
-    """)
-    conn.commit()
-    conn.close()
+    """Lokal SQLite bazasi jadvalini shakllantirish"""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS channel_music (
+                song_id TEXT PRIMARY KEY,
+                file_id TEXT NOT NULL,
+                title TEXT,
+                performer TEXT,
+                duration INTEGER,
+                channel_msg_id INTEGER
+            )
+        """)
+        conn.commit()
+        conn.close()
+        logger.info("✅ SQLite bazasi tayyor va ulandi.")
+    except Exception as e:
+        logger.error(f"❌ DB init error: {e}")
 
 init_db()
 
 def db_get_song(song_id: str) -> Optional[Dict[str, Any]]:
-    """Bazada qo'shiq bor-yo'qligini tekshirish"""
+    """Bazada qo'shiq file_id-si bor-yo'qligini tekshirish"""
     try:
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
-        cursor.execute("SELECT file_id, title, performer, duration, channel_msg_id FROM channel_music WHERE song_id = ?", (song_id,))
+        cursor.execute(
+            "SELECT file_id, title, performer, duration, channel_msg_id FROM channel_music WHERE song_id = ?",
+            (song_id,)
+        )
         row = cursor.fetchone()
         conn.close()
         if row:
@@ -85,7 +93,7 @@ def db_get_song(song_id: str) -> Optional[Dict[str, Any]]:
     return None
 
 def db_save_song(song_id: str, file_id: str, title: str, performer: str, duration: int, channel_msg_id: int):
-    """Yangi qo'shiqni bazaga saqlash"""
+    """Yangi qo'shiqni bazaga va keshga saqlash"""
     try:
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
@@ -95,17 +103,18 @@ def db_save_song(song_id: str, file_id: str, title: str, performer: str, duratio
         )
         conn.commit()
         conn.close()
+        logger.info(f"💾 Qo'shiq bazaga saqlandi: ID={song_id}")
     except Exception as e:
         logger.error(f"DB Save Error: {e}")
 
-# Cheklovlar va Vaqtlar
-MAX_FILE_SIZE_BYTES = 50 * 1024 * 1024  # Telegram Bot API 50MB cheklovi
-MAX_CONCURRENT_DOWNLOADS = 15          # Bir vaqtda maksimal parallel yuklashlar
-RATE_LIMIT_SECONDS = 2                 # Ketma-ket so'rov yuborish chegarasi (sekund)
-SEARCH_CACHE_TTL = 1800                # Qidiruv natijalari saqlanish vaqti (30 daqiqa)
-MEDIA_CACHE_TTL = 86400 * 7            # File ID kesh davri (7 kun)
+# Cheklovlar va Vaqt Parametrlari
+MAX_FILE_SIZE_BYTES = 50 * 1024 * 1024  # Telegram Bot API 50MB chegarasi
+MAX_CONCURRENT_DOWNLOADS = 15          # Bir vaqtning o'zidagi parallel yuklanishlar
+RATE_LIMIT_SECONDS = 2                 # Anti-Spam vaqti (sekund)
+SEARCH_CACHE_TTL = 1800                # Qidiruv natijalari kesh davri (30 daqiqa)
+MEDIA_CACHE_TTL = 86400 * 7            # Instagram/TikTok kesh davri (7 kun)
 
-# Proksi sozlamalari (Zarur bo'lsa kiriting, aks holda None)
+# Proksi (zarur bo'lsa kiriting, masalan: "http://user:pass@ip:port")
 ROTATING_PROXY = None
 
 HAS_FFMPEG = shutil.which("ffmpeg") is not None
@@ -114,7 +123,7 @@ redis_client: Optional[aioredis.Redis] = None
 local_cache: Dict[str, Any] = {}
 local_rate_limit: Dict[int, float] = {}
 
-# YT-DLP Umumiylashtirilgan Sozlamalari
+# YT-DLP Standart Sozlamalari
 YDL_GENERAL_OPTS = {
     "quiet": True,
     "no_warnings": True,
@@ -132,16 +141,17 @@ if ROTATING_PROXY:
 
 
 # ==========================================
-# 2. YORDAMCHI FUNKSIYALAR VA KESH
+# 2. YORDAMCHI FUNKSIYALAR VA KESH TIZIMI
 # ==========================================
 def seconds_to_min(seconds: int) -> str:
+    """Sekundlarni MM:SS formatiga o'tkazish"""
     if not seconds:
         return "0:00"
     m, s = divmod(int(seconds), 60)
     return f"{m}:{s:02d}"
 
 async def check_rate_limit(user_id: int) -> bool:
-    """Anti-Spam: Ketma-ket so'rov yuborishni cheklash"""
+    """Anti-Spam check: ketma-ket so'rov yuborishni cheklash"""
     now = time.time()
     if redis_client:
         try:
@@ -161,7 +171,7 @@ async def check_rate_limit(user_id: int) -> bool:
     return True
 
 async def set_user_search(chat_id: int, data: Dict[str, Any]):
-    """Qidiruv ma'lumotlarini saqlash"""
+    """Qidiruv natijalarini keshga saqlash"""
     if redis_client:
         try:
             await redis_client.setex(f"search:{chat_id}", SEARCH_CACHE_TTL, json.dumps(data))
@@ -171,7 +181,7 @@ async def set_user_search(chat_id: int, data: Dict[str, Any]):
     local_cache[f"search:{chat_id}"] = data
 
 async def get_user_search(chat_id: int) -> Optional[Dict[str, Any]]:
-    """Qidiruv ma'lumotlarini olish"""
+    """Keshdan qidiruv ma'lumotlarini olish"""
     if redis_client:
         try:
             val = await redis_client.get(f"search:{chat_id}")
@@ -182,7 +192,7 @@ async def get_user_search(chat_id: int) -> Optional[Dict[str, Any]]:
     return local_cache.get(f"search:{chat_id}")
 
 async def fetch_lyrics(song_title: str) -> Optional[str]:
-    """Qo'shiq so'zlarini izlab topish"""
+    """ShazamIO orqali qo'shiq matnini (lyrics) topish"""
     shazam = Shazam()
     try:
         search_res = await shazam.search_track(name=song_title, limit=1)
@@ -200,8 +210,9 @@ async def fetch_lyrics(song_title: str) -> Optional[str]:
     return None
 
 async def fetch_ig_profile(username: str) -> Optional[Dict[str, Any]]:
-    """Instagram profili ma'lumotlarini tezkor olish (HTML metadata parsing)"""
+    """Instagram profil ma'lumotlarini tahlil qilish"""
     loop = asyncio.get_running_loop()
+
     def _scrape():
         url = f"https://www.instagram.com/{username}/"
         headers = {
@@ -211,21 +222,19 @@ async def fetch_ig_profile(username: str) -> Optional[Dict[str, Any]]:
         req = urllib.request.Request(url, headers=headers)
         try:
             with urllib.request.urlopen(req, timeout=10) as response:
-                html = response.read().decode('utf-8', errors='ignore')
-            
+                html = response.read().decode("utf-8", errors="ignore")
+
             title_m = re.search(r'<meta\s+(?:property|name)="og:title"\s+content="([^"]+)"', html, re.IGNORECASE)
             desc_m = re.search(r'<meta\s+(?:property|name)="og:description"\s+content="([^"]+)"', html, re.IGNORECASE)
             img_m = re.search(r'<meta\s+(?:property|name)="og:image"\s+content="([^"]+)"', html, re.IGNORECASE)
-            
+
             full_name = username
-            followers = "Noma'lum"
-            following = "Noma'lum"
-            posts = "Noma'lum"
-            
+            followers, following, posts = "Noma'lum", "Noma'lum", "Noma'lum"
+
             if title_m:
                 raw_title = title_m.group(1)
                 full_name = raw_title.split("(@")[0].strip() if "(@" in raw_title else raw_title.split("•")[0].strip()
-                
+
             if desc_m:
                 desc = desc_m.group(1)
                 stats_match = re.search(r'([\d\,\.KkMm]+)\s+Followers,\s*([\d\,\.KkMm]+)\s+Following,\s*([\d\,\.KkMm]+)\s+Posts', desc, re.IGNORECASE)
@@ -233,7 +242,7 @@ async def fetch_ig_profile(username: str) -> Optional[Dict[str, Any]]:
                     followers = stats_match.group(1)
                     following = stats_match.group(2)
                     posts = stats_match.group(3)
-                    
+
             avatar_url = img_m.group(1) if img_m else None
             return {
                 "username": username,
@@ -241,7 +250,7 @@ async def fetch_ig_profile(username: str) -> Optional[Dict[str, Any]]:
                 "followers": followers,
                 "following": following,
                 "posts": posts,
-                "avatar_url": avatar_url
+                "avatar_url": avatar_url,
             }
         except Exception as e:
             logger.error(f"IG profile scrape error: {e}")
@@ -250,7 +259,7 @@ async def fetch_ig_profile(username: str) -> Optional[Dict[str, Any]]:
     return await loop.run_in_executor(None, _scrape)
 
 def render_search_page(chat_id: int, data: Dict[str, Any], page: int = 0):
-    """Qidiruv sahifasining tugmalarini tayyorlash"""
+    """Qidiruv natijalari menyusini tayyorlash"""
     query_title = data.get("query", "Musiqa qidiruvi")
     results = data.get("results", [])
 
@@ -297,22 +306,22 @@ def render_search_page(chat_id: int, data: Dict[str, Any], page: int = 0):
 
 
 # ==========================================
-# 3. HANDLERLAR (BOT BUYRUQLARI VA ISHLOV)
+# 3. HANDLERLAR VA ISHLOV MANTIQI
 # ==========================================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Start buyrug'i"""
     welcome_text = (
-        "👋 **Salom! Men yuqori tezlikda ishlovchi media yuklovchi va musiqa qidiruvchi botman!**\n\n"
-        "✨ **Imkoniyatlarim:**\n\n"
-        "🎵 **Musiqa qidirish:** Qo'shiq nomi yoki matnini yozing.\n"
-        "🎬 **Video yuklash:** Instagram, TikTok va YouTube havolasini yuboring.\n"
-        "🎧 **Shazam / Ovozli aniqlash:** Ovozli xabar, video yoki audio yuboring — fondagi musiqani topaman!\n\n"
-        "⚡️ *Istalgan havola yoki nomni yuboring!*"
+        "👋 **Salom! Men yuqori tezlikdagi multimediya yuklovchi va musiqa qidiruvchi botman!**\n\n"
+        "✨ **Mening imkoniyatlarim:**\n\n"
+        "🎵 **Musiqa qidirish:** Qo'shiq nomi yoki matnini yuboring.\n"
+        "🎬 **Video yuklash:** Instagram, TikTok va YouTube havolasini tashlang.\n"
+        "🎧 **Shazam / Ovozli aniqlash:** Ovozli xabar, video yoki musiqali fayl yuboring — topib beraman!\n\n"
+        "⚡️ *Istalgan havola yoki nomni yuborib ko'ring!*"
     )
     await update.message.reply_text(welcome_text, reply_markup=ReplyKeyboardRemove(), parse_mode="Markdown")
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Barcha matnli so'rovlar va havolalar bilan ishlash"""
+    """Matnlar, havolalar va qidiruv so'rovlariga ishlov berish"""
     user_id = update.effective_user.id
     chat_id = update.effective_chat.id
     text = update.message.text
@@ -320,9 +329,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not text:
         return
 
-    # Anti-Spam Tekshiruvi
+    # Anti-Spam Check
     if not await check_rate_limit(user_id):
-        await update.message.reply_text("⚠️ Juda ko'p so'rov yubordingiz. Biroz kutib qayta urinib ko'ring.")
+        await update.message.reply_text("⚠️ juda ko'p so'rov yubordingiz. Biroz kuting.")
         return
 
     # 1. Instagram Profil Tekshiruvi
@@ -333,10 +342,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if ig_profile_match:
         username = ig_profile_match.group(1).lower()
         reserved = ["p", "reel", "reels", "stories", "tv", "explore", "direct", "accounts"]
-        
+
         if username not in reserved:
             msg = await update.message.reply_text(f"🔍 Instagram profili tahlil qilinmoqda: @{username}...")
-
             profile = await fetch_ig_profile(username)
 
             if profile:
@@ -357,10 +365,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     await update.message.reply_text(caption, parse_mode="Markdown")
                 await msg.delete()
             else:
-                await msg.edit_text(f"ℹ️ Profil: @{username}\n(Profil yopiq yoki ma'lumot cheklangan)")
+                await msg.edit_text(f"ℹ️ Profil: @{username}\n(Profil yopiq yoki ma'lumot olish cheklangan)")
             return
 
-    # 2. Havolalarni (URL) aniqlash va yuklash
+    # 2. URL Havolalariga Ishlov Berish
     url_pattern = r"https?://(?:www\.)?[-a-zA-Z0-9@:%._\+~#=]{1,256}\.[a-zA-Z0-9()]{1,6}\b(?:[-a-zA-Z0-9()@:%_\+.~#?&//=]*)"
     urls = re.findall(url_pattern, text)
 
@@ -368,7 +376,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         url = urls[0]
         url_lower = url.lower()
 
-        # Redis Keshidan izlash
+        # Redis Keshidan Tekshirish
         if redis_client:
             try:
                 cached_file_id = await redis_client.get(f"media_cache:{url}")
@@ -378,7 +386,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except Exception:
                 pass
 
-        # 2-A. YouTube Video
+        # 2-A. YouTube Video Havolasi
         if "youtube.com" in url_lower or "youtu.be" in url_lower:
             msg = await update.message.reply_text("🔎 YouTube videosi tahlil qilinmoqda...")
             loop = asyncio.get_running_loop()
@@ -423,10 +431,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 caption_text = f"🎬 **{title}**\n\n📌 *Videoni qaysi format/sifatda yuklashni xohlaysiz?*"
                 await msg.edit_text(caption_text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
             except Exception as e:
-                await msg.edit_text(f"❌ YouTube havolasini ochishda xatolik: {str(e)[:100]}")
+                await msg.edit_text(f"❌ YouTube havolasida xatolik: {str(e)[:100]}")
             return
 
-        # 2-B. Instagram / TikTok Mediasini yuklash
+        # 2-B. Instagram / TikTok Mediasini Yuklash
         msg = await update.message.reply_text("📥 Media yuklanmoqda...")
         loop = asyncio.get_running_loop()
 
@@ -451,7 +459,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
                     for vid in videos:
                         if os.path.getsize(vid) > MAX_FILE_SIZE_BYTES:
-                            await update.message.reply_text("⚠️ Video hajmi 50MB dan katta bo'lgani uchun yuborib bo'lmaydi.")
+                            await update.message.reply_text("⚠️ Video hajmi 50MB dan katta bo'lgani uchun yuklab bo'lmadi.")
                             if os.path.exists(vid):
                                 os.remove(vid)
                             continue
@@ -483,10 +491,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 else:
                     await msg.edit_text("❌ Mediani yuklab bo'lmadi.")
             except Exception as e:
-                await msg.edit_text(f"❌ Yuklashda xatolik yuz berdi: {str(e)[:100]}")
+                await msg.edit_text(f"❌ Yuklashda xatolik: {str(e)[:100]}")
         return
 
-    # 3. Qo'shiq Nomi Orqali Qidiruv
+    # 3. Qo'shiq Nomi Orqali Izlash
     msg = await update.message.reply_text("🎧 Qo'shiqlar qidirilmoqda...")
     loop = asyncio.get_running_loop()
 
@@ -533,10 +541,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     except Exception as e:
         logger.error(f"Search error: {e}")
-        await msg.edit_text("❌ Qidiruvda xatolik yuz berdi.")
+        await msg.edit_text("❌ Qidiruv jarayonida xatolik yuz berdi.")
 
 async def handle_direct_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Voice, Video yoki Audio kelganda Shazam orqali musiqani aniqlash"""
+    """Voice, Video, Audio xabarlaridan Shazam orqali musiqani aniqlash"""
     message = update.message
     status_msg = await message.reply_text("🎧 Media qabul qilindi! Shazam orqali musiqa aniqlanmoqda...")
 
@@ -581,6 +589,7 @@ async def handle_direct_media(update: Update, context: ContextTypes.DEFAULT_TYPE
             await status_msg.edit_text(f"✅ Topildi: **{subtitle} - {title}**\n\n🔎 Variantlar qidirilmoqda...", parse_mode="Markdown")
 
             loop = asyncio.get_running_loop()
+
             def search_shazam_variants():
                 opts = dict(YDL_GENERAL_OPTS)
                 opts.update({"extract_flat": True, "skip_download": True})
@@ -613,7 +622,7 @@ async def handle_direct_media(update: Update, context: ContextTypes.DEFAULT_TYPE
             os.remove(file_path)
 
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Tugmalar bosilganda ishlash (Callback Queries)"""
+    """Tugmalar bosilgandagi callback hodisalariga ishlov berish"""
     query = update.callback_query
     await query.answer()
     chat_id = update.effective_chat.id
@@ -663,17 +672,18 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await status_msg.edit_text(f"❌ **{song_title}** uchun matn topilmadi.", parse_mode="Markdown")
         return
 
+    # 3. Videodagi Musiqani Shazam Orqali Topish
     elif data.startswith("shazam_"):
         if not HAS_FFMPEG:
             await query.message.reply_text("⚠️ **Xatolik: FFmpeg o'rnatilmagan!** Shazam ishlashi uchun FFmpeg talab etiladi.")
             return
 
         status_msg = await query.message.reply_text("🎧 Shazam videodagi musiqani aniqlamoqda...")
-        
+
         video_obj = query.message.video or query.message.video_note or query.message.audio or query.message.voice
         if not video_obj:
             try:
-                await status_msg.edit_text("❌ Musiqa izlash uchun video fayl topilmadi.")
+                await status_msg.edit_text("❌ Musiqa izlash uchun media fayli topilmadi.")
             except Exception:
                 pass
             return
@@ -697,6 +707,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     pass
 
                 loop = asyncio.get_running_loop()
+
                 def search_shazam_variants():
                     opts = dict(YDL_GENERAL_OPTS)
                     opts.update({"extract_flat": True, "skip_download": True})
@@ -732,9 +743,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 except Exception:
                     pass
         except asyncio.TimeoutError:
-            logger.error("Shazam yoki Telegram yuklash vaqti tugadi (Timeout)")
+            logger.error("Shazam Timeout")
             try:
-                await status_msg.edit_text("⏰ Server bilan aloqa sekinlashdi. Iltimos, qaytadan urinib ko'ring.")
+                await status_msg.edit_text("⏰ Server bilan aloqa sekinlashdi. Qayta urinib ko'ring.")
             except Exception:
                 pass
         except Exception as e:
@@ -748,7 +759,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 os.remove(temp_file_path)
         return
 
-    # 3. YouTube Video/Audio Yuklash
+    # 4. YouTube Video/Audio Yuklash
     elif data.startswith("yt_"):
         parts = data.split("_")
         quality = parts[1]
@@ -767,9 +778,10 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             yt_data = local_cache.get(f"yt_info:{video_id}")
 
         if not yt_data:
-            await query.message.reply_text("⚠️ Havola eskirgan. Qayta yuboring.")
+            await query.message.reply_text("⚠️ Havola eskirgan. Qaytadan yuboring.")
             return
 
+        # Agar audio bo'lsa va bazada bor bo'lsa - darhol yuboramiz
         if quality == "audio":
             cached_db_song = db_get_song(video_id)
             if cached_db_song:
@@ -887,7 +899,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await status_msg.edit_text(f"❌ Yuklash xatoligi: {str(e)[:100]}")
         return
 
-    # 4. Qidiruv natijalaridan MP3 yuklash
+    # 5. Qidiruv Natijalaridan MP3 Yuklash
     elif data.startswith("song_"):
         idx = int(data.split("_")[1])
         search_data = await get_user_search(chat_id)
@@ -902,8 +914,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         item = results[idx]
-        song_id = item['id']
+        song_id = item["id"]
 
+        # 1-Navbatda SQLite Bazani Tekshirish
         cached_db_song = db_get_song(song_id)
         if cached_db_song:
             kb = [[InlineKeyboardButton("📜 Qo'shiq so'zlari", callback_data=f"lyrics_yt_{song_id}")]]
@@ -1001,22 +1014,22 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ==========================================
-# 4. BOTNI ISHGA TUSHIRISH
+# 4. BOTNI ISHGA TUSHIRISH (MAIN)
 # ==========================================
 async def post_init(application: Application):
-    """Bot ishga tushganida Redis ulanishini tekshirish"""
+    """Bot ishga tushganida Redis aloqasini o'rnatish"""
     global redis_client
     try:
         redis_client = aioredis.from_url(REDIS_URL)
         await redis_client.ping()
         logger.info("✅ Redis ma'lumotlar bazasiga ulandi!")
     except Exception as e:
-        logger.warning(f"⚠️ Redis ga ulanib bo'lmadi ({e}). Bot local kesh rejimida ishlaydi.")
+        logger.warning(f"⚠️ Redis ulanmadi ({e}). Bot lokal kesh rejimida ishlaydi.")
 
 def main():
     if TOKEN == "YOUR_TELEGRAM_BOT_TOKEN_HERE" or ":" not in TOKEN:
         print("\n❌ XATOLIK: Bot TOKEN kiritilmagan!")
-        print("💡 Telegram'da @BotFather ga kirib olgan tokeningizni main.py faylidagi TOKEN o'rniga qo'ying.\n")
+        print("💡 Telegram'da @BotFather'dan olgan tokeningizni kiriting.\n")
         return
 
     app = (
