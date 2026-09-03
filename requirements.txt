@@ -1,4 +1,4 @@
 python-telegram-bot>=20.0
-yt-dlp
+yt-dlp>=2024.08.06
 shazamio
 redis
